@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Launcher: ./cwa-organizer [command] [options]   (see ./cwa-organizer --help)
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PY="${PYTHON:-python3}"
+if ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+  echo "cwa-organizer needs Python 3.11 or newer." >&2
+  exit 1
+fi
+exec env PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m cwa_organizer "$@"

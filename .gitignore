@@ -1,0 +1,12 @@
+# Personal settings and secrets
+config.toml
+secrets.toml
+aliases.toml
+
+# Generated
+runs/
+backups/
+state/
+review/
+__pycache__/
+*.pyc
