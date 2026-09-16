@@ -66,7 +66,7 @@ This calibre should be the same version as the one inside CWA, or newer. The sch
 
 ```bash
 cd ~/Software_Scripts
-git clone <this repo> cwa-organizer      # or copy the folder here
+git clone <https://github.com/Rangermike96/cwa-organizer.git> cwa-organizer      # or copy the folder here
 cd cwa-organizer
 chmod +x cwa-organizer
 ./cwa-organizer init
