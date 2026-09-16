@@ -51,6 +51,8 @@ def run(ctx) -> None:
         new, why = new_title_for(b, ctx.cfg, pubs)
         if not new or new == b.title:
             continue
+        if new.casefold() == b.title.casefold():
+            continue  # case-only title changes rename the folder case-only, which is unsafe on some shares
         if not ctx.within_limit(PASS):
             break
         if lib.set(b, "title", new, PASS, why or "cleaned"):

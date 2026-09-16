@@ -183,6 +183,14 @@ def run(ctx) -> None:
                 counts[n] += 1
 
     norm = AuthorNormalizer(counts, ctx.aliases["authors"], acfg["flip_only_when_counterpart_exists"])
+    # calibre treats author names case-insensitively and re-cases an existing author for ALL their
+    # books at once, renaming folders case-only. That is unsafe on some shares (it deleted files on
+    # an Unraid NFS share), so a new name that differs from an existing author only by capitalisation
+    # always takes the existing spelling.
+    existing_case = {}
+    for b in lib.books.values():
+        for a in b.authors:
+            existing_case.setdefault(fold(a), a)
     changed = 0
     for b in sorted(lib.books.values(), key=lambda x: x.id):
         new, reasons = [], []
@@ -201,6 +209,11 @@ def run(ctx) -> None:
                 reasons.append(f"split '{a}'")
             for n in names:
                 c, why = norm.canonical(n)
+                if fold(c) in existing_case and existing_case[fold(c)] != c:
+                    kept = existing_case[fold(c)]
+                    if c != n or kept != a:
+                        why = f"kept existing capitalisation '{kept}'"
+                    c = kept
                 if why and c != a:
                     reasons.append(f"'{n}' -> '{c}' ({why})")
                 elif n != a and len(names) == 1:

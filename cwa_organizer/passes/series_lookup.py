@@ -33,8 +33,11 @@ def run(ctx) -> None:
         return
     hcfg, fcfg = ctx.cfg["hardcover"], ctx.cfg["fetch"]
     taken = {(skey(b.series), f"{b.series_index:.4f}") for b in lib.books.values() if b.series}
+    # Books whose titles carry a volume number belong to the series pass (collision checks, --limit).
+    numbered = ("explicit", "bare", "range", "complex", "explicit-unsafe")
     todo = [b for b in lib.books.values()
-            if not b.series and not b.hints.get("junk_author") and not b.hints.get("series_withheld")]
+            if not (b.hints.get("parsed") and b.hints["parsed"].kind in numbered)
+            and not b.series and not b.hints.get("junk_author") and not b.hints.get("series_withheld")]
     found = 0
     cap = ctx.lookup_cap("Series lookup", len(todo))
     total = min(cap or len(todo), len(todo))
@@ -82,4 +85,5 @@ def run(ctx) -> None:
             ctx.stat(PASS, "books_changed")
             break
     bar.__exit__(None, None, None)
-    ctx.log.info(f"Series lookup: {len(todo)} book(s) without a series checked on Hardcover, {found} assigned.")
+    checked = min(total, n) if todo else 0
+    ctx.log.info(f"Series lookup: {checked} of {len(todo)} book(s) without a series checked on Hardcover, {found} assigned.")

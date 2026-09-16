@@ -189,17 +189,27 @@ def run(cfg: Config, opt: RunOptions) -> int:
                     if name in FLUSH_AFTER:
                         ctx.flush(f"after {name}")
                 ctx.flush("end of run")
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, calibre_bridge.ApplierInterrupted):
                 ProgressBar.stop_all()
                 interrupted = True
-                log.warn("Interrupted. " + ("Writing the report for what was planned so far..." if opt.dry_run
-                                            else "Saving the work planned so far..."))
-                try:
-                    ctx.flush("interrupted")
-                except KeyboardInterrupt:
-                    log.error("Interrupted again; unsaved changes were dropped. The journal has everything written.")
+                if opt.dry_run:
+                    log.warn("Interrupted. Writing the report for what was planned so far...")
+                elif ctx.writing or isinstance(sys.exc_info()[1], calibre_bridge.ApplierInterrupted):
+                    log.warn("Interrupted while writing. calibre finished the book it was on and stopped; "
+                             "the rest of this batch was not written.")
+                else:
+                    pending = len(lib.pending_ops())
+                    if pending:
+                        log.warn(f"Interrupted. Saving the {pending} book change(s) already worked out "
+                                 "(press Ctrl+C again to stop after the current book)...")
+                        try:
+                            ctx.flush("interrupted")
+                        except (KeyboardInterrupt, calibre_bridge.ApplierInterrupted):
+                            log.warn("Stopped. Anything not written yet was dropped; the journal lists what was written.")
+                    else:
+                        log.warn("Interrupted.")
 
-            if not opt.dry_run and ctx.batch_no:
+            if not opt.dry_run and ctx.wrote_anything:
                 _verify(cfg, run_dir, snap, lib, log)
             meta["status"] = "interrupted" if interrupted else "finished"
             summary = write_reports(ctx, {"run_id": run_id, "dry_run": opt.dry_run, "passes": opt.passes,
@@ -214,7 +224,7 @@ def run(cfg: Config, opt: RunOptions) -> int:
             if not opt.dry_run:
                 w = ctx.write_counts
                 log.info(f"Written: {w['applied']} book(s); skipped {w['skipped']}, failed {w['failed']}, partial {w['partial']}.")
-                if ctx.batch_no:
+                if ctx.wrote_anything:
                     log.info(f"Undo this run with:  ./cwa-organizer undo {run_id}")
             return 130 if interrupted else 0
     except safety.SafetyError as e:
@@ -222,10 +232,20 @@ def run(cfg: Config, opt: RunOptions) -> int:
         meta["status"] = "refused"
         return 2
     except calibre_bridge.CalibreError as e:
+        ProgressBar.stop_all()
         log.error(str(e))
         meta["status"] = "failed"
-        if ctx and ctx.batch_no:
-            log.error(f"Some changes were written before the failure. Undo them with: ./cwa-organizer undo {run_id}")
+        if ctx is not None:
+            if ctx.wrote_anything:
+                log.error(f"Some changes were written before the failure. Undo them with: ./cwa-organizer undo {run_id}")
+            else:
+                log.error("Nothing was written to the library.")
+            try:
+                write_reports(ctx, {"run_id": run_id, "dry_run": opt.dry_run, "passes": opt.passes,
+                                    "backup": meta.get("backup"), "status": "failed"})
+                log.error(f"Report of what was planned: {run_dir / 'report.html'}")
+            except Exception as rep_err:  # noqa: BLE001
+                log.error(f"Could not write the report: {rep_err}")
         return 4
     finally:
         ProgressBar.stop_all()
@@ -308,7 +328,11 @@ def undo(cfg: Config, target_run: str, dry_run: bool, yes: bool) -> int:
             backup = safety.make_backup(cfg, snap, run_id)
             log.info(f"Backup saved: {backup}")
             try:
-                recs = calibre_bridge.apply_plan(cfg, ops, run_dir / "plan-undo.json", run_dir / "journal.jsonl")
+                recs = calibre_bridge.apply_plan(cfg, ops, run_dir / "plan-undo.json", run_dir / "journal.jsonl",
+                                                 log=log.warn)
+            except calibre_bridge.ApplierInterrupted:
+                recs = calibre_bridge._read_journal(run_dir / "journal.jsonl", 0)
+                log.warn("Undo stopped by Ctrl+C after the current book. Run the same undo again to finish it.")
             except calibre_bridge.ApplyError as e:
                 recs = e.records
                 log.error(str(e))
@@ -317,6 +341,8 @@ def undo(cfg: Config, target_run: str, dry_run: bool, yes: bool) -> int:
                 counts[r["status"]] = counts.get(r["status"], 0) + 1
                 if r["status"] != "applied":
                     log.warn(f"[{r['book_id']}] {r['status']}: {r.get('error')}")
+                for fld, why in (r.get("withheld") or {}).items():
+                    log.warn(f"[{r['book_id']}] {fld} left as is: {why}")
             log.info(f"Undo finished: {counts}")
             _verify(cfg, run_dir, snap, None, log)
             snap.unlink(missing_ok=True)

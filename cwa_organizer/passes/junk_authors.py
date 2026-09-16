@@ -9,6 +9,7 @@ Anything else is listed for review and the book is left unchanged.
 from __future__ import annotations
 
 import random
+import re
 import time
 from collections import defaultdict
 
@@ -24,11 +25,14 @@ def _person_key(name: str) -> str:
     return "".join(sorted(words_key(name).split()))
 
 
+_QUERY_NOISE = re.compile(r"\b(?:LQ|HQ|HD|RAW|scan(?:s|ned)?|digital|novel\s+yaoi|yaoi\s+novel|yaoi|bl\s+novel)\b", re.I)
+
+
 def _query_for(book) -> str:
     p = book.hints.get("parsed")
-    if p and p.series:
-        return p.series
-    return p.cleaned if p else book.title
+    q = p.series if p and p.series else (p.cleaned if p else book.title)
+    cleaned = " ".join(_QUERY_NOISE.sub(" ", q).split())
+    return cleaned or q
 
 
 def run(ctx) -> None:
@@ -58,7 +62,7 @@ def run(ctx) -> None:
         junk = b.hints["junk_author"]
         # A publisher hint from the brackets can be used even offline.
         hint_pub = b.hints.get("publisher_hint")
-        if hint_pub and not b.publisher:
+        if hint_pub and not b.publisher and ctx.within_limit(PASS):
             pub = pubnorm.canonical(hint_pub) if pubnorm else hint_pub
             lib.set(b, "publisher", pub, PASS, f"publisher taken from release filename '{list(junk)[0]}'")
 

@@ -13,10 +13,14 @@ Modes
       differs, skip the whole book. Otherwise write each field and append one
       JSON line to the journal (flushed per book) with before/after values.
 """
+import faulthandler
 import json
 import os
 import sys
 import traceback
+
+# If calibre's native code crashes ("free(): invalid pointer"), print where it happened.
+faulthandler.enable(file=sys.stderr, all_threads=True)
 
 
 def _out(obj):
@@ -152,18 +156,73 @@ def mode_ensure_columns(library, spec_file):
     _out({"created": created})
 
 
-def mode_apply(library, plan_file, journal_file):
+def _author_case_map(cache):
+    out = {}
+    try:
+        for name in cache.get_id_map("authors").values():
+            out.setdefault(_fold(name), set()).add(name)
+    except Exception:
+        pass
+    return out
+
+
+def _path_guard(cache, bid, fields, author_case):
+    """Reason to withhold a title/author change, or None.
+
+    calibre renames a book's folder when its title or first author changes.
+    On shares where the same folder can be reached under different
+    capitalisations (for example Unraid user shares over NFS), calibre can
+    mistake a case-only rename for a move to a different folder and delete
+    the book's files. So case-only folder renames are never attempted, and
+    neither is changing the capitalisation of an existing author (calibre
+    applies that to every book by the author at once).
+    """
+    if "title" not in fields and "authors" not in fields:
+        return None
+    for a in fields.get("authors") or []:
+        names = author_case.get(_fold(a))
+        if names and a not in names:
+            return ("would change the capitalisation of existing author '%s' to '%s', which renames folders "
+                    "case-only (unsafe on this library's share)" % (sorted(names)[0], a))
+    title = fields.get("title") or cache.field_for("title", bid)
+    authors = list(fields.get("authors") or cache.field_for("authors", bid) or ())
+    if not authors:
+        return None
+    cur = cache.field_for("path", bid) or ""
+    try:
+        new = cache.backend.construct_path_name(bid, title, authors[0])
+    except Exception:
+        return None
+    if new == cur or not cur:
+        return None
+    if new.lower() == cur.lower():
+        return "would rename the book folder only by capitalisation ('%s' -> '%s'), which is unsafe on this share" % (cur, new)
+    target = os.path.join(cache.backend.library_path, *new.split("/"))
+    try:
+        if os.path.isdir(target) and any(n != "metadata.opf" for n in os.listdir(target)):
+            return "the new folder '%s' already exists and contains files" % new
+    except OSError:
+        pass
+    return None
+
+
+def mode_apply(library, plan_file, journal_file, stop_file=None):
     with open(plan_file) as fh:
         plan = json.load(fh)
     db = _open(library)
     cache = db.new_api
     counts = {"applied": 0, "skipped": 0, "failed": 0, "partial": 0}
+    stopped = False
     try:
         all_ids = set(cache.all_book_ids())
+        author_case = _author_case_map(cache)
         with open(journal_file, "a", encoding="utf-8") as jf:
             for op in plan["ops"]:
+                if stop_file and os.path.exists(stop_file):
+                    stopped = True  # asked to stop between books: finish cleanly
+                    break
                 bid = int(op["book_id"])
-                fields, expect = op["fields"], op.get("expect", {})
+                fields, expect = dict(op["fields"]), op.get("expect", {})
                 rec = {"book_id": bid, "title": op.get("title"), "status": None,
                        "before": {}, "after": {}, "actual": {}, "error": None}
                 if bid not in all_ids:
@@ -177,10 +236,19 @@ def mode_apply(library, plan_file, journal_file):
                             rec["error"] = "changed since planning: " + ", ".join(diffs)
                             rec["actual"] = live
                         else:
+                            reason = _path_guard(cache, bid, fields, author_case)
+                            if reason:
+                                rec["withheld"] = {f: reason for f in ("title", "authors") if f in fields}
+                                rec["actual"] = {f: live[f] for f in rec["withheld"]}
+                                for f in rec["withheld"]:
+                                    fields.pop(f)
                             rec["before"] = live
                             for f in sorted(fields, key=lambda x: ORDER.index(x) if x in ORDER else 50):
                                 _write(cache, bid, f, fields[f])
                                 rec["after"][f] = fields[f]
+                                if f == "authors":
+                                    for a in fields[f]:
+                                        author_case.setdefault(_fold(a), set()).add(a)
                             rec["status"] = "applied"
                     except Exception as e:  # keep going with the next book
                         rec["error"] = f"{type(e).__name__}: {e}"
@@ -208,7 +276,7 @@ def mode_apply(library, plan_file, journal_file):
         cache.dump_metadata()
     finally:
         db.close()
-    _out({"done": True, "counts": counts})
+    _out({"done": True, "counts": counts, "stopped": stopped})
 
 
 def main(argv):
@@ -221,7 +289,7 @@ def main(argv):
     elif mode == "ensure-columns":
         mode_ensure_columns(rest[0], rest[1])
     elif mode == "apply":
-        mode_apply(rest[0], rest[1], rest[2])
+        mode_apply(rest[0], rest[1], rest[2], rest[3] if len(rest) > 3 else None)
     else:
         print(f"unknown mode {mode}")
         return 2

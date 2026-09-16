@@ -84,8 +84,8 @@ def run(ctx) -> None:
     seen = set()
     for i, a in enumerate(distinct):
         for bname in distinct[i + 1:]:
-            if pub_key(a) == pub_key(bname):
-                continue
+            if pub_key(a) == pub_key(bname) or norm.canonical(a) == norm.canonical(bname):
+                continue  # already merged automatically
             ka, kb = pub_key(a), pub_key(bname)
             if (ka.startswith(kb) or kb.startswith(ka)) and min(len(ka), len(kb)) >= 5 or similarity(a, bname) >= 0.9:
                 pair = tuple(sorted((a, bname)))

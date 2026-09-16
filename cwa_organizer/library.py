@@ -167,6 +167,11 @@ class Library:
                     if f.fmt.upper() in (r.get("formats") or {}):
                         f.name = r["formats"][f.fmt.upper()]
             if r["status"] == "applied":
+                for fld in (r.get("withheld") or {}):
+                    # calibre refused this field (unsafe rename): memory goes back to what is in the database
+                    val = (r.get("actual") or {}).get(fld, b._written.get(fld))
+                    b._written[fld] = copy.deepcopy(val)
+                    setattr(b, fld, copy.deepcopy(val))
                 for fld, val in r["after"].items():
                     if fld == "cover":
                         b.hints.pop("new_cover", None)

@@ -47,6 +47,9 @@ Presets choose several passes at once. `all` runs every pass, `offline` runs the
 - It saves a verified backup to `backups/metadata-<run id>.db`, and keeps the last 20 by default.
 - It opens a throwaway copy with this computer's calibre first, to make sure calibre won't upgrade the database schema. A newer schema could leave CWA unable to read the library.
 - It writes in batches through calibre. Each book's write first checks that the values are still what was planned, and skips the book if not. Every write is appended to `runs/<run id>/journal.jsonl` with its before and after values.
+- It never asks calibre to rename a folder only by capitalisation (for example, author `NISIOISIN` becoming `Nisioisin`, or a title changing only in case). On shares where one folder can be reached under several capitalisations, such as Unraid user shares over NFS, calibre can mistake that for a move and delete the book's files. Those changes are left out, and listed for review. Change them by hand only if your share is case-sensitive.
+- calibre runs in its own process group, so Ctrl+C never kills it mid-write. It finishes the book it's on, closes the database and stops.
+- If calibre crashes, the books it hadn't reached are retried, up to twice, and its full error output is saved next to the batch in the run folder.
 - After writing, it checks the database's integrity and book count again.
 - `./cwa-organizer undo <run id>` reverses a run, newest change first. Undo is better than restoring a backup, because calibre renames folders when titles and authors change, and an old database copy would point at folder names that no longer exist.
 
@@ -66,7 +69,7 @@ This calibre should be the same version as the one inside CWA, or newer. The sch
 
 ```bash
 cd ~/Software_Scripts
-git clone <https://github.com/Rangermike96/cwa-organizer.git> cwa-organizer      # or copy the folder here
+git clone https://github.com/Rangermike96/cwa-organizer.git cwa-organizer
 cd cwa-organizer
 chmod +x cwa-organizer
 ./cwa-organizer init
@@ -179,12 +182,15 @@ The organizer creates two custom columns the first time it writes: **Book Type**
 - **The changes look wrong.** Stop CWA and run `./cwa-organizer undo <run id>`. To preview the undo first, add `--dry-run`.
 - **The post-run integrity check failed.** Don't start CWA. Undo usually still works. If the database can't be opened, copy the newest file from `backups/` over `metadata.db` in the library folder, then run calibre's **Check library** tool. Folder renames made by the run may need fixing, and `journal.jsonl` shows what changed.
 - **Many books were skipped with "changed since planning".** Something else wrote to the library during the run. Find out what it was before running again.
+- **calibre crashed ("free(): invalid pointer").** calibre's own process died. Books it hadn't reached are retried automatically; if it keeps crashing, the run stops. The full output is in `runs/<id>/plan-*.stderr.log`, which is worth attaching to a bug report. Nothing half-written is left behind, because each book is written in one step and journaled.
+- **The file check reports "file missing" after a run with an older version.** Versions before the case-rename guard could lose files for books whose author changed only in capitalisation on a case-insensitive share. The book records and metadata are intact; add the book file back with calibre or Calibre-Web ("Add format" / upload).
 
 ## Tests
 
 ```bash
 python3 -m unittest discover -s tests -v   # parsing, matching and classification rules
 python3 tests/e2e_calibre.py               # builds a throwaway calibre library, writes, checks, undoes (needs calibre)
+python3 tests/e2e_safety.py                # case-only rename guard, clean stop, crash retry (needs calibre)
 python3 tests/e2e_calibre.py --online      # same, including MangaUpdates and a real metadata fetch
 ```
 

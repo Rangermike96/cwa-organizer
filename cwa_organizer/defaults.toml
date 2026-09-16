@@ -30,6 +30,9 @@ fetch_ebook_metadata = "fetch-ebook-metadata"
 ebook_meta = "ebook-meta"
 # How many books to write per batch during the long online passes.
 flush_every = 25
+# Largest number of books handed to one calibre process. Smaller chunks mean
+# less to retry if calibre crashes, and a Ctrl+C stops sooner.
+write_chunk = 500
 
 [columns]
 # Custom columns created (if missing) the first time a run writes.

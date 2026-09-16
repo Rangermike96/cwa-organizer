@@ -65,6 +65,7 @@ class RunContext:
         self.batch_no = 0
         self.write_counts = {"applied": 0, "skipped": 0, "failed": 0, "partial": 0}
         self.columns_ready = False
+        self.writing = False
         self._cache = None
         self._mu = None
         self._hc = None
@@ -189,31 +190,65 @@ class RunContext:
                 self.log.info("Created custom columns: " + ", ".join("#" + c for c in created))
             self.columns_ready = True
         self.batch_no += 1
-        plan = self.run_dir / f"plan-{self.batch_no:04d}.json"
         journal = self.run_dir / "journal.jsonl"
+        chunk = max(1, int(self.cfg["calibre"].get("write_chunk", 500)))
         self.log.info(f"Writing batch {self.batch_no} ({len(ops)} book(s)){' - ' + reason if reason else ''}...")
+        batch = {"applied": 0, "skipped": 0, "failed": 0, "partial": 0}
+        self.writing = True
         try:
             with self.progress(f"Writing batch {self.batch_no}", len(ops)) as bar:
-                records = calibre_bridge.apply_plan(self.cfg, ops, plan, journal, on_progress=bar.update)
-        except calibre_bridge.ApplyError as e:
-            self.lib.mark_written(e.records)
-            for r in e.records:
-                self.write_counts[r["status"]] = self.write_counts.get(r["status"], 0) + 1
-            raise
-        self.lib.mark_written(records)
-        # Books in the plan with no journal record were never reached (crash).
-        reached = {r["book_id"] for r in records}
-        missing = [op["book_id"] for op in ops if op["book_id"] not in reached]
-        batch = {"applied": 0, "skipped": 0, "failed": 0, "partial": 0}
+                for ci in range(0, len(ops), chunk):
+                    part = ops[ci:ci + chunk]
+                    plan = self.run_dir / f"plan-{self.batch_no:04d}-{ci // chunk + 1:03d}.json"
+                    base = ci
+
+                    def progress(n, _base=base):
+                        bar.update(n=_base + n)
+
+                    jstart = journal.stat().st_size if journal.exists() else 0
+                    try:
+                        records = calibre_bridge.apply_plan(self.cfg, part, plan, journal, on_progress=progress,
+                                                            log=self.log.warn)
+                    except calibre_bridge.ApplierInterrupted:
+                        self._account(calibre_bridge._read_journal(journal, jstart), part, batch)
+                        self.log.info("  applied {applied}, skipped {skipped}, failed {failed}, partial {partial}"
+                                      " before stopping".format(**batch))
+                        raise
+                    except calibre_bridge.ApplyError as e:
+                        self._account(e.records, part, batch)
+                        raise
+                    self._account(records, part, batch)
+        finally:
+            self.writing = False
+        self.log.info("  applied {applied}, skipped {skipped}, failed {failed}, partial {partial}".format(**batch))
+
+    def _account(self, records, part, batch):
+        """Fold journal records into the model, counters and review list (once per record)."""
+        seen = getattr(self, "_accounted", None)
+        if seen is None:
+            seen = self._accounted = set()
+        ids = {op["book_id"] for op in part}
+        fresh = []
         for r in records:
+            key = (self.batch_no, r["book_id"])
+            if r["book_id"] not in ids or key in seen:
+                continue
+            seen.add(key)
+            fresh.append(r)
+        self.lib.mark_written(fresh)
+        for r in fresh:
             batch[r["status"]] = batch.get(r["status"], 0) + 1
             self.write_counts[r["status"]] = self.write_counts.get(r["status"], 0) + 1
             if r["status"] != "applied":
                 self.log.warn(f"[{r['book_id']}] {r['status']}: {r.get('error')}")
                 self.lib.add_review("write-problem", [r["book_id"]], f"{r['status']}: {r.get('error')}")
-        self.log.info("  applied {applied}, skipped {skipped}, failed {failed}, partial {partial}".format(**batch))
-        if missing:
-            raise RuntimeError(f"calibre stopped before writing {len(missing)} book(s); see {journal}")
+            for fld, why in (r.get("withheld") or {}).items():
+                self.lib.add_review("withheld-rename", [r["book_id"]],
+                                    f"'{r.get('title')}': {fld} not changed: {why}. Change it by hand if you need to.")
+
+    @property
+    def wrote_anything(self) -> bool:
+        return (self.write_counts.get("applied", 0) + self.write_counts.get("partial", 0)) > 0
 
     def save_summary(self, extra: dict) -> None:
         (self.run_dir / "summary.json").write_text(json.dumps(extra, indent=2, default=str))

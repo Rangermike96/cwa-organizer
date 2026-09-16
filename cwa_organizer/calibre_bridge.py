@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -27,11 +29,32 @@ def _require(cmd: str) -> str:
     return path
 
 
-def _run_applier(cfg: Config, args: list[str], timeout: int | None = None, poll=None) -> list[dict]:
-    """Run the applier. `poll` is called about twice a second while it runs."""
+_last_exit = 0.0  # when the previous calibre-debug process ended
+MIN_GAP_SECONDS = 3.0
+
+
+class ApplierInterrupted(Exception):
+    """Ctrl+C reached us; calibre was told to stop after the current book and has exited."""
+
+
+def _run_applier(cfg: Config, args: list[str], timeout: int | None = None, poll=None,
+                 stderr_log: Path | None = None, stop_file: Path | None = None) -> list[dict]:
+    """Run the applier in its own session so Ctrl+C can never kill calibre mid-write.
+
+    `poll` is called about twice a second. On Ctrl+C the stop file is created;
+    the applier finishes the book it is on, closes the database and exits, and
+    ApplierInterrupted is raised. calibre's full stderr goes to `stderr_log`.
+    """
+    global _last_exit
     exe = _require(cfg["calibre"]["calibre_debug"])
+    gap = time.monotonic() - _last_exit
+    if gap < MIN_GAP_SECONDS:
+        time.sleep(MIN_GAP_SECONDS - gap)  # let the previous process fully release the database
+    env = dict(os.environ, PYTHONFAULTHANDLER="1")
+    interrupted = False
     with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
-        p = subprocess.Popen([exe, "-e", str(APPLIER), "--", *args], stdout=out, stderr=err, text=True)
+        p = subprocess.Popen([exe, "-e", str(APPLIER), "--", *args], stdout=out, stderr=err, text=True,
+                             env=env, start_new_session=True)
         started = time.monotonic()
         try:
             while True:
@@ -45,13 +68,21 @@ def _run_applier(cfg: Config, args: list[str], timeout: int | None = None, poll=
                         p.kill()
                         p.wait()
                         raise
-        except KeyboardInterrupt:
-            # Let calibre finish the book it is on and close the database cleanly.
-            p.wait()
-            raise
+                except KeyboardInterrupt:
+                    if stop_file is None:
+                        continue  # nothing safe to do but wait for calibre to finish
+                    if not interrupted:
+                        interrupted = True
+                        stop_file.touch()
+                        print("\nStopping after the book calibre is writing now (this can take a few seconds)...",
+                              file=sys.stderr, flush=True)
+        finally:
+            _last_exit = time.monotonic()
         out.seek(0)
         err.seek(0)
         proc = subprocess.CompletedProcess(p.args, p.returncode, out.read(), err.read())
+    if stderr_log is not None and (proc.stderr or proc.returncode):
+        stderr_log.write_text(f"exit code: {proc.returncode}\n\n{proc.stderr}")
     lines = []
     for ln in proc.stdout.splitlines():
         ln = ln.strip()
@@ -62,8 +93,11 @@ def _run_applier(cfg: Config, args: list[str], timeout: int | None = None, poll=
                 pass
     if proc.returncode != 0:
         err = next((x.get("error") for x in lines if x.get("error")), None)
-        tail = (proc.stderr or "").strip().splitlines()[-15:]
-        raise CalibreError(err or ("calibre-debug failed (exit %d):\n%s" % (proc.returncode, "\n".join(tail))))
+        tail = [t for t in (proc.stderr or "").strip().splitlines() if t.strip()][-6:]
+        where = f" (full output: {stderr_log})" if stderr_log else ""
+        raise CalibreError(err or ("calibre-debug failed (exit %d)%s:\n%s" % (proc.returncode, where, "\n".join(tail))))
+    if interrupted:
+        raise ApplierInterrupted()
     return lines
 
 
@@ -99,27 +133,7 @@ class ApplyError(CalibreError):
         self.records = records
 
 
-def apply_plan(cfg: Config, ops: list[dict], plan_file: Path, journal_file: Path, library_path: Path | None = None,
-               on_progress=None) -> list[dict]:
-    """Write ops through calibre. Returns this batch's journal records.
-
-    If calibre fails part-way, ApplyError carries the records that did reach
-    the journal, so the caller can still account for them.
-    """
-    plan_file.write_text(json.dumps({"ops": ops}, indent=1, default=str))
-    start = journal_file.stat().st_size if journal_file.exists() else 0
-    error = None
-
-    def poll():
-        if on_progress and journal_file.exists():
-            with open(journal_file, "rb") as fh:
-                fh.seek(start)
-                on_progress(n=fh.read().count(b"\n"))
-
-    try:
-        _run_applier(cfg, ["apply", str(library_path or cfg.library), str(plan_file), str(journal_file)], poll=poll)
-    except (CalibreError, subprocess.TimeoutExpired, OSError) as e:
-        error = e
+def _read_journal(journal_file: Path, start: int) -> list[dict]:
     records = []
     if journal_file.exists():
         with open(journal_file, encoding="utf-8") as fh:
@@ -131,9 +145,60 @@ def apply_plan(cfg: Config, ops: list[dict], plan_file: Path, journal_file: Path
                         records.append(json.loads(ln))
                     except ValueError:
                         pass
-    if error is not None:
-        raise ApplyError(f"calibre failed while writing: {error}", records)
     return records
+
+
+def apply_plan(cfg: Config, ops: list[dict], plan_file: Path, journal_file: Path, library_path: Path | None = None,
+               on_progress=None, retries: int = 2, log=None) -> list[dict]:
+    """Write ops through calibre and return the journal records for them.
+
+    If calibre crashes, the books it had not reached are retried (up to
+    `retries` more times). That is safe because every op checks the live
+    values first, so a book that was written is never written twice.
+    Ctrl+C stops cleanly after the current book (ApplierInterrupted).
+    If it still fails, ApplyError carries the records that were written.
+    """
+    start = journal_file.stat().st_size if journal_file.exists() else 0
+    stop_file = plan_file.with_suffix(".stop")
+    stop_file.unlink(missing_ok=True)
+    remaining = list(ops)
+    attempt = 0
+    while True:
+        attempt += 1
+        suffix = "" if attempt == 1 else f"-retry{attempt - 1}"
+        pf = plan_file.with_name(plan_file.stem + suffix + plan_file.suffix)
+        pf.write_text(json.dumps({"ops": remaining}, indent=1, default=str))
+        done_before = len(ops) - len(remaining)
+
+        def poll():
+            if on_progress and journal_file.exists():
+                with open(journal_file, "rb") as fh:
+                    fh.seek(start)
+                    on_progress(n=fh.read().count(b"\n"))
+
+        error = None
+        try:
+            _run_applier(cfg, ["apply", str(library_path or cfg.library), str(pf), str(journal_file), str(stop_file)],
+                         poll=poll, stderr_log=pf.with_suffix(".stderr.log"), stop_file=stop_file)
+        except ApplierInterrupted:
+            stop_file.unlink(missing_ok=True)
+            raise
+        except (CalibreError, subprocess.TimeoutExpired, OSError) as e:
+            error = e
+        records = _read_journal(journal_file, start)
+        if error is None:
+            return records
+        reached = {r["book_id"] for r in records}
+        remaining = [op for op in remaining if op["book_id"] not in reached]
+        progressed = len(ops) - len(remaining) > done_before
+        if not remaining:
+            return records  # it crashed while closing, after every book was written
+        if attempt > retries:
+            raise ApplyError(f"calibre failed while writing: {error}", records)
+        if log:
+            log(f"calibre crashed ({str(error).splitlines()[0]}); {len(remaining)} book(s) not written yet"
+                f"{'' if progressed else ' (none were written in that attempt)'}. Retrying in 5 seconds...")
+        time.sleep(5)
 
 
 def extract_cover(cfg: Config, book_file: Path, out_file: Path, timeout: int = 120) -> bool:
