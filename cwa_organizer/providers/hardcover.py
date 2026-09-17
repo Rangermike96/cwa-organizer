@@ -69,6 +69,7 @@ class Hardcover:
                 "slug": doc.get("slug"),
                 "title": clean_text(doc.get("title")),
                 "subtitle": clean_text(doc.get("subtitle")),
+                "description": (doc.get("description") or "").strip(),
                 "authors": [clean_text(a) for a in _as_list(doc.get("author_names")) if a],
                 "series": series_name,
                 "position": position,

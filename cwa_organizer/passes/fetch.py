@@ -16,13 +16,69 @@ import random
 import time
 
 from ..library import is_undefined_date
-from ..providers.calibre_fetch import CalibreFetcher, FetchResult
+from ..providers.calibre_fetch import CalibreFetcher, FetchedMeta, FetchResult
+from ..providers.http import HttpError
 from ..textutil import clean_text, fold, similarity, words_key
 from .series import skey
 from ..titles import parse_title, standard_title, title_variants
 
 PASS = "fetch"
 STATUS_FETCHED, STATUS_FAILED = "Fetched", "Failed"
+
+
+class Pacer:
+    """Keeps a minimum gap between provider calls, and widens it when a source rate-limits us.
+
+    Google answers bursts of requests with HTTP 429, which used to cost minutes
+    of retries per book. Spacing the calls out costs seconds and avoids most of them.
+    """
+
+    def __init__(self, base: float, cap: float):
+        self.base = max(0.0, float(base))
+        self.cap = max(float(cap), self.base)
+        self.gap = self.base
+        self.last = 0.0
+
+    def wait(self) -> None:
+        left = self.gap - (time.monotonic() - self.last)
+        if left > 0:
+            time.sleep(left)
+        self.last = time.monotonic()
+
+    def penalize(self) -> None:
+        self.gap = min(self.cap, max(self.base, self.gap * 2) if self.gap else max(self.base, 2.0))
+
+    def relax(self) -> None:
+        self.gap = max(self.base, self.gap / 2)
+
+
+def _latin(text: str) -> bool:
+    """True when a title is written in Latin script (a stand-in language check)."""
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return False
+    return sum(1 for c in letters if c.isascii()) / len(letters) >= 0.8
+
+
+def from_hardcover(hit: dict) -> FetchedMeta:
+    """Turn a Hardcover search hit into the same shape a calibre source returns."""
+    m = FetchedMeta()
+    m.title = f"{hit['title']}: {hit['subtitle']}" if hit.get("subtitle") else (hit.get("title") or "")
+    m.authors = [a for a in (hit.get("authors") or []) if a]
+    m.comments = hit.get("description") or ""
+    # Hardcover only gives a release year, and a made-up January 1st is worse
+    # than an empty date, so the publication date is left alone.
+    m.pubdate = ""
+    ids = {}
+    if hit.get("slug"):
+        ids["hardcover"] = str(hit["slug"])
+    isbn13 = next((str(i) for i in (hit.get("isbns") or []) if len(str(i).replace("-", "")) == 13), "")
+    if isbn13:
+        ids["isbn"] = isbn13.replace("-", "")
+    m.identifiers = ids
+    m.series = hit.get("series") or ""
+    m.series_index = hit.get("position")
+    return m
 
 
 def needs_fetch(b, cfg, status_col, force: bool) -> bool:
@@ -61,11 +117,15 @@ def our_volume(book, parsed):
     return None
 
 
-def validate(meta, book, parsed, file_medium, cfg) -> str | None:
-    """Return a rejection reason, or None if the match is acceptable."""
+def validate(meta, book, parsed, file_medium, cfg, assume_english: bool = False) -> str | None:
+    """Return a rejection reason, or None if the match is acceptable.
+
+    assume_english is for sources that carry no language field (Hardcover); the
+    caller checks the script of the title instead.
+    """
     fc = cfg["fetch"]
     langs = [x.lower() for x in meta.languages]
-    if not langs or langs[0] not in ("eng", "en", "en-us", "en-gb"):
+    if not assume_english and (not langs or langs[0] not in ("eng", "en", "en-us", "en-gb")):
         return f"language {langs[0] if langs else 'missing'}, not English"
     if not meta.authors:
         return "no author in the result"
@@ -196,9 +256,42 @@ def run(ctx) -> None:
         bar.__exit__(None, None, None)
 
 
+def _short(detail: str, limit: int = 140) -> str:
+    """calibre prints its whole session log on an error; keep the useful head of it."""
+    return " ".join((detail or "").split())[:limit]
+
+
+def _try_hardcover(ctx, hc, book, parsed, medium, author, rejected) -> tuple:
+    """Last resort when the calibre sources have nothing acceptable."""
+    cfg = ctx.cfg
+    query = standard_title(parsed, "Vol.") or (parsed.cleaned if parsed else book.title)
+    try:
+        hits = hc.search_books(f"{query} {author}" if author else query)
+        if not hits:
+            hits = hc.search_books(query)
+    except (HttpError, RuntimeError) as e:
+        ctx.provider_failed("hardcover", e)
+        return None, ""
+    for hit in hits:
+        meta = from_hardcover(hit)
+        if not meta.title or not _latin(meta.title):
+            continue
+        if not (meta.comments or meta.identifiers):
+            continue  # nothing this source could add
+        reason = validate(meta, book, parsed, medium, cfg, assume_english=True)
+        if reason:
+            rejected.append(f"Hardcover '{meta.title}' -> {reason}")
+            ctx.log.detail(f"    Hardcover '{meta.title}': rejected, {reason}")
+            continue
+        return meta, meta.title
+    return None, ""
+
+
 def _fetch_loop(ctx, todo, fetcher, fc, flush_every, bar) -> None:
     lib, cfg = ctx.lib, ctx.cfg
-    streak = done = ok = failed = errors = 0
+    streak = done = ok = failed = errors = hc_ok = 0
+    pacer = Pacer(fc["min_request_gap"], fc["max_request_gap"])
+    hc = ctx.hardcover() if fc["hardcover_fallback"] else None
     for n, b in enumerate(todo, 1):
         bar.update(n=n - 1, item=f"matched {ok} · no match {failed} · {b.title}")
         parsed = b.hints.get("parsed")
@@ -206,7 +299,7 @@ def _fetch_loop(ctx, todo, fetcher, fc, flush_every, bar) -> None:
             parsed = parse_title(b.title, getattr(ctx, "known_publishers", []), cfg["titles"]["bracket_junk_words"])
         author = None if b.hints.get("junk_author") else (b.authors[0] if b.authors else None)
         ctx.log.info(f"[{n}/{len(todo)}] [{b.id}] {b.title} - {author or '(no usable author)'}")
-        matched, rejected, had_error, no_match_seen = None, [], False, False
+        matched, rejected, had_error, no_match_seen, from_hc = None, [], False, False, False
         variants = title_variants(parsed, fc["max_title_variants"])
         medium = ctx.book_medium(b)
         std = standard_title(parsed, "Vol.") if our_volume(b, parsed) is not None else None
@@ -214,19 +307,27 @@ def _fetch_loop(ctx, todo, fetcher, fc, flush_every, bar) -> None:
             # Providers often list the manga and the light novel under one title; say which one we want.
             variants.insert(1, f"{std} ({'Light Novel' if medium == 'novel' else 'Manga'})")
             variants = variants[: max(fc["max_title_variants"], 2)]
+        # Source errors (mostly Google's 429) share one retry budget for the whole book:
+        # retrying every phrasing separately used to cost minutes and made the 429s worse.
+        err_budget = fc["max_retries"]
         for variant in variants:
             res = None
-            for attempt in range(1, fc["max_retries"] + 2):
+            for attempt in range(fc["max_retries"] + 1):
+                pacer.wait()
                 res = fetcher.fetch(variant, author)
                 if res.kind != FetchResult.ERROR:
+                    pacer.relax()
                     break
-                wait = min(fc["retry_backoff_base"] * 2 ** (attempt - 1), fc["retry_backoff_cap"])
-                ctx.log.detail(f"    '{variant}': {res.detail}; retry in {wait}s")
-                if attempt <= fc["max_retries"]:
-                    time.sleep(wait)
+                pacer.penalize()
+                if err_budget <= 0:
+                    break
+                err_budget -= 1
+                wait = min(fc["retry_backoff_base"] * 2 ** attempt, fc["retry_backoff_cap"])
+                ctx.log.detail(f"    '{variant}': {_short(res.detail)}; retry in {wait}s")
+                time.sleep(wait)
             if res.kind == FetchResult.ERROR:
                 had_error = True
-                ctx.log.detail(f"    '{variant}': gave up ({res.detail})")
+                ctx.log.detail(f"    '{variant}': gave up ({_short(res.detail)})")
                 continue
             if res.kind == FetchResult.NO_MATCH:
                 no_match_seen = True
@@ -244,11 +345,30 @@ def _fetch_loop(ctx, todo, fetcher, fc, flush_every, bar) -> None:
                 ctx.log.detail(f"    matched with phrasing '{variant}'")
             break
 
+        if matched is None and hc is not None and "hardcover" not in ctx.provider_errors_given_up():
+            # The calibre sources miss volumes Hardcover has (Google often lists only
+            # omnibus or manga editions of a light novel).
+            found, why = _try_hardcover(ctx, hc, b, parsed, medium, author, rejected)
+            if found:
+                matched, from_hc = found, True
+                ctx.log.detail(f"    matched on Hardcover as '{why}'")
+
         if matched:
+            src = " on Hardcover" if from_hc else ""
             fields = merge(ctx, b, matched, parsed)
-            set_status(ctx, b, STATUS_FETCHED, f"metadata found: '{matched.title}'" + (f" ({', '.join(fields)})" if fields else ""))
-            ctx.log.info(f"    matched '{matched.title}'" + (f"; filled {', '.join(fields)}" if fields else "; nothing new"))
+            still_missing = [f for f in fc["required_fields"]
+                             if (is_undefined_date(b.pubdate) if f == "pubdate" else not b.get(f))]
+            if from_hc and still_missing:
+                # Hardcover has no publisher and no full date. Leaving the status unset
+                # means a later run tries the other sources again for what is missing.
+                ctx.log.info(f"    matched{src} '{matched.title}'; filled {', '.join(fields) or 'nothing'}"
+                             f"; still missing {', '.join(still_missing)}, so it stays on the list for next time")
+            else:
+                set_status(ctx, b, STATUS_FETCHED,
+                           f"metadata found{src}: '{matched.title}'" + (f" ({', '.join(fields)})" if fields else ""))
+                ctx.log.info(f"    matched{src} '{matched.title}'" + (f"; filled {', '.join(fields)}" if fields else "; nothing new"))
             ok += 1
+            hc_ok += 1 if from_hc else 0
             streak = 0
         elif had_error and not no_match_seen and not rejected:
             errors += 1
@@ -274,4 +394,5 @@ def _fetch_loop(ctx, todo, fetcher, fc, flush_every, bar) -> None:
                 streak = 0
             else:
                 time.sleep(fc["sleep_base"] + random.uniform(0, fc["sleep_jitter"]))
-    ctx.log.info(f"Fetch: {ok} matched, {failed} without an acceptable match, {errors} left for retry.")
+    ctx.log.info(f"Fetch: {ok} matched{f' ({hc_ok} of them on Hardcover)' if hc_ok else ''}, "
+                 f"{failed} without an acceptable match, {errors} left for retry.")

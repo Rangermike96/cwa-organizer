@@ -20,7 +20,7 @@ The organizer works in passes. You can run all of them or pick the ones you want
 | `titles` | Removes release junk and `(Light Novel)` markers, and standardizes titles to `Series, Vol. 3: Subtitle`. | no |
 | `classify` | Sets the Book Type column and a matching tag to Light Novel, Manga or Other Books. | yes (MangaUpdates) |
 | `series_lookup` | Uses Hardcover to find series for books whose titles have no volume number. | yes (Hardcover key) |
-| `fetch` | Fills in missing descriptions, publishers, dates, identifiers and tags from Google, Open Library and Edelweiss. | yes |
+| `fetch` | Fills in missing descriptions, publishers, dates, identifiers and tags from Google, Open Library and Edelweiss, falling back to Hardcover. | yes |
 | `covers` | Adds missing covers, first by extracting them from the book file and then from online sources. | sometimes |
 | `tag_backfill` | Adds a genre tag to every volume in a series when all the tagged volumes already have it. | no |
 | `files` | Report only: missing, empty or damaged EPUB, CBZ and PDF files. | no |
@@ -83,7 +83,7 @@ chmod +x cwa-organizer
 
 **Edit `config.toml`.** Check `library.path` first. Then set `safety.cwa_url` to CWA's web address, for example `http://192.168.1.149:8083`, so the tool can confirm CWA is stopped. If you leave it empty, you'll be asked to confirm by hand.
 
-**Add a Hardcover API key (optional).** It's only used for series lookups and author lookups. Sign in at hardcover.app, open **Account Settings → Hardcover API** (`https://hardcover.app/account/api`), click **New API Key**, give it a label, pick an expiry and copy the token. Paste it into `secrets.toml`:
+**Add a Hardcover API key (optional).** It is used for series lookups, author lookups, and as the fallback source in the fetch pass when Google, Open Library and Edelweiss have nothing usable (they often carry only the omnibus or manga edition of a light novel). Hardcover has no publisher and only a release year, so a book filled from it keeps no status mark and is tried again on a later run, when the other sources may have the rest. Sign in at hardcover.app, open **Account Settings → Hardcover API** (`https://hardcover.app/account/api`), click **New API Key**, give it a label, pick an expiry and copy the token. Paste it into `secrets.toml`:
 
 ```toml
 hardcover_api_key = "eyJ..."
