@@ -15,7 +15,7 @@ from pathlib import Path
 
 
 WRITABLE = (
-    "title", "authors", "tags", "series", "series_index", "publisher",
+    "title", "authors", "author_sort", "tags", "series", "series_index", "publisher",
     "identifiers", "languages", "comments", "pubdate",
 )
 UNDEFINED_DATE_PREFIX = ("0101-01-01", "0100-12-31", "0000")
@@ -60,6 +60,8 @@ class Book:
     pubdate: str | None
     formats: list
     custom: dict  # '#label' -> value (str or None)
+    author_sort: str = ""
+    author_sorts: dict = field(default_factory=dict)  # author name -> the author record's sort value
     hints: dict = field(default_factory=dict)  # notes shared between passes, never written
     _written: dict = field(default_factory=dict, repr=False)
 
@@ -95,7 +97,7 @@ def same_value(fld: str, a, b) -> bool:
         if ua or ub:
             return ua and ub
         return str(a)[:10] == str(b)[:10]
-    if fld in ("series", "publisher", "comments") or fld.startswith("#"):
+    if fld in ("series", "publisher", "comments", "author_sort") or fld.startswith("#"):
         return (a or "") == (b or "")
     return a == b
 
@@ -221,17 +223,20 @@ def _load(con, library_path, custom_labels) -> Library:
     user_version = q("PRAGMA user_version")[0][0]
 
     books = {}
-    for r in q("SELECT id, title, path, has_cover, series_index, pubdate FROM books"):
+    for r in q("SELECT id, title, path, has_cover, series_index, pubdate, author_sort FROM books"):
         books[r["id"]] = Book(
             id=r["id"], path=r["path"], has_cover=bool(r["has_cover"]), title=r["title"] or "",
             authors=[], tags=[], series=None, series_index=float(r["series_index"] or 1.0),
             publisher=None, identifiers={}, languages=[], comments="", pubdate=r["pubdate"],
-            formats=[], custom={},
+            formats=[], custom={}, author_sort=r["author_sort"] or "",
         )
 
-    for r in q("SELECT l.book, a.name FROM books_authors_link l JOIN authors a ON a.id=l.author ORDER BY l.book, l.id"):
+    for r in q("SELECT l.book, a.name, a.sort FROM books_authors_link l JOIN authors a ON a.id=l.author "
+               "ORDER BY l.book, l.id"):
         if r[0] in books:
-            books[r[0]].authors.append((r[1] or "").replace("|", ","))  # calibre stores "," as "|"
+            name = (r[1] or "").replace("|", ",")  # calibre stores "," as "|"
+            books[r[0]].authors.append(name)
+            books[r[0]].author_sorts[name] = (r[2] or "").replace("|", ",")
     for r in q("SELECT l.book, t.name FROM books_tags_link l JOIN tags t ON t.id=l.tag ORDER BY l.book, l.id"):
         if r[0] in books:
             books[r[0]].tags.append(r[1])

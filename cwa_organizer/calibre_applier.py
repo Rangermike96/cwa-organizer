@@ -40,7 +40,14 @@ def _fold(s):
 
 def _read(cache, book_id, fld):
     if fld == "cover":
-        return None if not cache.field_for("cover", book_id) else True
+        # A fingerprint, not a flag: undo must be able to tell the image this run
+        # wrote from one the owner put there afterwards.
+        import hashlib
+        try:
+            data = cache.cover(book_id)
+        except Exception:
+            data = None
+        return hashlib.sha1(data).hexdigest() if data else None
     v = cache.field_for(fld, book_id)
     if fld in ("tags", "authors", "languages"):
         return list(v or ())
@@ -63,7 +70,20 @@ def _read(cache, book_id, fld):
     return v
 
 
-def _same(fld, a, b):
+def _same(fld, a, b, strict=False):
+    """Is the live value still the one we expect?
+
+    strict=True compares exactly, letter for letter. Undo uses it: a title or an
+    author the owner re-capitalised by hand is an edit we must not step on, even
+    though calibre itself treats those names case-insensitively.
+    """
+    if strict:
+        if fld in ("tags", "languages"):
+            return sorted((x or "").strip() for x in (a or [])) == sorted((x or "").strip() for x in (b or []))
+        if fld == "authors":
+            return [(x or "").strip() for x in (a or [])] == [(x or "").strip() for x in (b or [])]
+        if fld in ("title", "series", "publisher", "comments") or fld.startswith("#"):
+            return (a or "") == (b or "")
     if fld == "tags":
         return sorted(_fold(x) for x in (a or [])) == sorted(_fold(x) for x in (b or []))
     if fld == "series_index":
@@ -80,15 +100,16 @@ def _same(fld, a, b):
         return [_fold(x) for x in (a or [])] == [_fold(x) for x in (b or [])]
     if fld in ("series", "publisher"):
         return _fold(a) == _fold(b)
-    if fld in ("comments", "title") or fld.startswith("#"):
+    if fld in ("comments", "title", "author_sort") or fld.startswith("#"):
         return (a or "") == (b or "")
     return a == b
 
 
 # Write order matters: series before series_index, title/authors last-but-cover
 # so a failure in a cheap field happens before any folder rename.
+# author_sort comes after authors: calibre recomputes it whenever authors change.
 ORDER = ["tags", "publisher", "identifiers", "languages", "comments", "pubdate",
-         "series", "series_index", "title", "authors", "cover"]
+         "series", "series_index", "title", "authors", "author_sort", "cover"]
 
 
 def _write(cache, book_id, fld, value):
@@ -223,6 +244,7 @@ def mode_apply(library, plan_file, journal_file, stop_file=None):
                     break
                 bid = int(op["book_id"])
                 fields, expect = dict(op["fields"]), op.get("expect", {})
+                strict = bool(op.get("strict"))  # undo sets this: compare exactly
                 rec = {"book_id": bid, "title": op.get("title"), "status": None,
                        "before": {}, "after": {}, "actual": {}, "error": None}
                 if bid not in all_ids:
@@ -230,11 +252,12 @@ def mode_apply(library, plan_file, journal_file, stop_file=None):
                 else:
                     try:
                         live = {f: _read(cache, bid, f) for f in fields}
-                        diffs = [f for f in fields if f in expect and not _same(f, live[f], expect[f])]
+                        diffs = [f for f in fields if f in expect and not _same(f, live[f], expect[f], strict)]
                         if diffs:
                             rec["status"] = "skipped"
                             rec["error"] = "changed since planning: " + ", ".join(diffs)
                             rec["actual"] = live
+                            rec["expected"] = {f: expect[f] for f in diffs}
                         else:
                             reason = _path_guard(cache, bid, fields, author_case)
                             if reason:
@@ -245,7 +268,8 @@ def mode_apply(library, plan_file, journal_file, stop_file=None):
                             rec["before"] = live
                             for f in sorted(fields, key=lambda x: ORDER.index(x) if x in ORDER else 50):
                                 _write(cache, bid, f, fields[f])
-                                rec["after"][f] = fields[f]
+                                # For a cover, record what is now on disk, not the source path.
+                                rec["after"][f] = _read(cache, bid, f) if f == "cover" else fields[f]
                                 if f == "authors":
                                     for a in fields[f]:
                                         author_case.setdefault(_fold(a), set()).add(a)

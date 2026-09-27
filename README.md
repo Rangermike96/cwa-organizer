@@ -16,6 +16,7 @@ The organizer works in passes. You can run all of them or pick the ones you want
 | `publishers` | Merges spellings like `VIZ Media, LLC` and `VIZMedia` into one publisher, and applies aliases. | no |
 | `junk_authors` | Replaces placeholder authors that came from release filenames (`Vol 02 [June][Scans][4FF7E520]`, `VeryPDF`, `© DENSUKE 2019`), but only when the lookup is confident. | yes |
 | `authors` | Splits `A; B` into separate authors, removes illustrator and translator credits, flips `Last, First` names, and merges case and spacing variants. Fuzzier variants are only suggested. | no |
+| `author_sort` | Rebuilds each book's `author_sort` from its own author records, so Calibre-Web can show names in reading order and sort them correctly. Books imported by other tools often join two authors with "and" instead of `&`, which Calibre-Web logs as an error. | no |
 | `series` | Sets series and volume number from titles, merges series names that differ only in spelling, detects collisions, and reports gaps. | no |
 | `titles` | Removes release junk and `(Light Novel)` markers, and standardizes titles to `Series, Vol. 3: Subtitle`. | no |
 | `classify` | Sets the Book Type column and a matching tag to Light Novel, Manga or Other Books. | yes (MangaUpdates) |
@@ -52,6 +53,7 @@ Presets choose several passes at once. `all` runs every pass, `offline` runs the
 - If calibre crashes, the books it hadn't reached are retried, up to twice, and its full error output is saved next to the batch in the run folder.
 - After writing, it checks the database's integrity and book count again.
 - `./cwa-organizer undo <run id>` reverses a run, newest change first. Undo is better than restoring a backup, because calibre renames folders when titles and authors change, and an old database copy would point at folder names that no longer exist.
+- Undo never overwrites a later edit. Each reversal carries the exact value that run left behind, and the book is only touched if every one of those fields still holds it, compared letter for letter — so a title you fixed by hand, a change CWA made, or a newer organizer run all stop the reversal for that book. Such books are skipped whole rather than half-reverted, and listed in `runs/undo-<id>/kept.csv` with the value they hold now and the one the undo expected. Covers work the same way: the journal records a fingerprint of the image that was written, and a cover that no longer matches it is left alone.
 
 **You must stop the CWA container before any run that writes.** Dry runs are safe while CWA is running.
 
@@ -190,7 +192,7 @@ The organizer creates two custom columns the first time it writes: **Book Type**
 ```bash
 python3 -m unittest discover -s tests -v   # parsing, matching and classification rules
 python3 tests/e2e_calibre.py               # builds a throwaway calibre library, writes, checks, undoes (needs calibre)
-python3 tests/e2e_safety.py                # case-only rename guard, clean stop, crash retry (needs calibre)
+python3 tests/e2e_safety.py                # case-only rename guard, clean stop, crash retry, undo guard (needs calibre)
 python3 tests/e2e_calibre.py --online      # same, including MangaUpdates and a real metadata fetch
 ```
 

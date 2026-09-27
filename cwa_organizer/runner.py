@@ -1,6 +1,7 @@
 """Orchestrates a run: lock, safety checks, snapshot, backup, passes, batched writes, verification, reports."""
 from __future__ import annotations
 
+import csv
 import datetime as dt
 import json
 import shutil
@@ -13,8 +14,8 @@ from .config import Config
 from .context import Log, RunContext
 from .library import load_library
 from .progress import ProgressBar
-from .passes import (analyze, authors, checks, classify, covers, fetch, junk_authors, publishers, series,
-                     series_lookup, tag_backfill, tags, titles)
+from .passes import (analyze, author_sort, authors, checks, classify, covers, fetch, junk_authors,
+                     publishers, series, series_lookup, tag_backfill, tags, titles)
 from .report import write_reports
 
 PASSES = {
@@ -22,6 +23,7 @@ PASSES = {
     "publishers": (publishers.run, "Normalize publisher names"),
     "junk_authors": (junk_authors.run, "Replace filename-junk authors (online lookups)"),
     "authors": (authors.run, "Normalize author names; write spelling suggestions"),
+    "author_sort": (author_sort.run, "Rebuild author_sort from the author records (fixes Calibre-Web sorting)"),
     "series": (series.run, "Series and volume numbers from titles; collisions; gaps"),
     "titles": (titles.run, "Strip release junk and standardize volume titles"),
     "classify": (classify.run, "Light Novel / Manga / Other Books (MangaUpdates + file contents)"),
@@ -36,7 +38,8 @@ ORDER = list(PASSES)
 FLUSH_AFTER = {"titles", "classify", "series_lookup", "fetch", "covers", "tag_backfill", "junk_authors"}
 PRESETS = {
     "all": ORDER,
-    "offline": ["tags", "publishers", "authors", "series", "titles", "tag_backfill", "files", "duplicates"],
+    "offline": ["tags", "publishers", "authors", "author_sort", "series", "titles", "tag_backfill",
+                "files", "duplicates"],
     "classify": ["tags", "classify"],
     "fetch": ["tags", "publishers", "fetch"],
     "report": ["files", "duplicates"],
@@ -336,17 +339,32 @@ def undo(cfg: Config, target_run: str, dry_run: bool, yes: bool) -> int:
             except calibre_bridge.ApplyError as e:
                 recs = e.records
                 log.error(str(e))
-            counts = {}
+            counts, changed_since = {}, []
             for r in recs:
                 counts[r["status"]] = counts.get(r["status"], 0) + 1
-                if r["status"] != "applied":
+                if r["status"] == "skipped" and "changed since" in (r.get("error") or ""):
+                    changed_since.append(r)
+                elif r["status"] != "applied":
                     log.warn(f"[{r['book_id']}] {r['status']}: {r.get('error')}")
                 for fld, why in (r.get("withheld") or {}).items():
                     log.warn(f"[{r['book_id']}] {fld} left as is: {why}")
+            if changed_since:
+                out = run_dir / "kept.csv"
+                with open(out, "w", encoding="utf-8", newline="") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(["book_id", "title", "fields_that_differ", "value_now", "value_that_run_left"])
+                    for r in changed_since:
+                        exp = r.get("expected") or {}
+                        now = {f: v for f, v in (r.get("actual") or {}).items() if f in exp}
+                        w.writerow([r["book_id"], r.get("title") or "", ", ".join(sorted(exp)),
+                                    json.dumps(now, ensure_ascii=False)[:2000],
+                                    json.dumps(exp, ensure_ascii=False)[:2000]])
+                log.info(f"{len(changed_since)} book(s) were edited after that run and were left exactly as they are; "
+                         f"see {out}")
             log.info(f"Undo finished: {counts}")
             _verify(cfg, run_dir, snap, None, log)
             snap.unlink(missing_ok=True)
-            return 0 if counts.get("applied", 0) == len(ops) else 5
+            return 0 if not (counts.get("failed") or counts.get("partial")) else 5
     except safety.SafetyError as e:
         log.error(str(e))
         return 2
@@ -355,7 +373,13 @@ def undo(cfg: Config, target_run: str, dry_run: bool, yes: bool) -> int:
 
 
 def build_undo_ops(records: list[dict]) -> tuple[list[dict], list[str]]:
-    """Reverse journal records, newest first. Each op expects the value that run wrote."""
+    """Reverse journal records, newest first.
+
+    Every op carries, as `expect`, the exact value that run left behind, and is
+    marked strict so the applier compares it letter for letter. A book whose
+    fields no longer match - because it was edited by hand, by CWA, or by a later
+    organizer run - is skipped whole, never half-reverted.
+    """
     ops, notes = [], []
     for r in reversed(records):
         if r.get("status") not in ("applied", "partial") or not r.get("after"):
@@ -367,11 +391,18 @@ def build_undo_ops(records: list[dict]) -> tuple[list[dict], list[str]]:
                 if old_val:
                     notes.append(f"[{r['book_id']}] had a cover before; the old image can't be restored, left as is.")
                     continue
-                fields["cover"], expect["cover"] = None, True
+                if not isinstance(new_val, str) or len(new_val) != 40:
+                    # Journals written before covers were fingerprinted: we cannot tell
+                    # this run's image from a newer one, so we leave the cover alone.
+                    notes.append(f"[{r['book_id']}] cover left as is: this run predates cover fingerprints, "
+                                 "so a newer image cannot be told apart from the one it wrote.")
+                    continue
+                fields["cover"], expect["cover"] = None, new_val
                 continue
             fields[fld], expect[fld] = old_val, new_val
         if fields:
-            ops.append({"book_id": r["book_id"], "title": r.get("title"), "fields": fields, "expect": expect})
+            ops.append({"book_id": r["book_id"], "title": r.get("title"),
+                        "fields": fields, "expect": expect, "strict": True})
     return ops, notes
 
 

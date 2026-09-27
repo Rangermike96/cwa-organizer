@@ -86,6 +86,43 @@ def main():
     assert now[b3]["tags"] == ["Three"] and now[b4]["tags"] == ["Four"], (now[b3], now[b4])
     assert list(proj.glob("plan-crash.stderr.log")), "stderr log not saved"
     print("3 ok: crash retried, books written, stderr saved")
+
+    # 4) a book edited after a run is left alone by that run's undo
+    from cwa_organizer import runner  # noqa: E402
+    rid = "20200101-000000"
+    rdir = cfg.runs_dir / rid
+    rdir.mkdir(parents=True, exist_ok=True)
+    b5 = rows["Book Four"]["id"]
+    journal = [
+        # this run set the title and the tags; afterwards the owner edits the title by hand
+        {"book_id": b5, "title": "Book Four", "status": "applied",
+         "before": {"title": "Book Four", "tags": ["Four"]},
+         "after": {"title": "Book Four, Vol. 1", "tags": ["Four", "Light Novel"]}},
+    ]
+    (rdir / "journal.jsonl").write_text("\n".join(json.dumps(r) for r in journal) + "\n")
+    calibredb(lib, "set_metadata", "--field", "title:Book Four, Vol. 1 (fixed by hand)", str(b5))
+    calibredb(lib, "set_metadata", "--field", "tags:Four,Light Novel", str(b5))
+    cfg.data["calibre"]["calibre_debug"] = "calibre-debug"
+    rc = runner.undo(cfg, rid, dry_run=False, yes=True)
+    now = {r["id"]: r for r in dump(lib)}[b5]
+    assert now["title"] == "Book Four, Vol. 1 (fixed by hand)", now
+    assert now["tags"] == ["Four", "Light Novel"], now
+    kept = sorted(cfg.runs_dir.glob("undo-*/kept.csv"))
+    assert kept and str(b5) in kept[-1].read_text(), "the skipped book was not reported"
+    assert rc == 0, f"undo rc={rc}"
+    print("4 ok: undo left a book that was edited afterwards untouched")
+
+    # 5) the same undo still reverses a book nobody touched
+    rid2 = "20200101-000001"
+    rdir2 = cfg.runs_dir / rid2
+    rdir2.mkdir(parents=True, exist_ok=True)
+    b6 = rows["Book Three"]["id"]
+    (rdir2 / "journal.jsonl").write_text(json.dumps(
+        {"book_id": b6, "title": "Book Three", "status": "applied",
+         "before": {"tags": []}, "after": {"tags": ["Three"]}}) + "\n")
+    assert runner.undo(cfg, rid2, dry_run=False, yes=True) == 0
+    assert {r["id"]: r for r in dump(lib)}[b6]["tags"] in ([], None), "untouched book was not reversed"
+    print("5 ok: an untouched book is still reversed")
     print(f"\nSAFETY OK. Work folder: {tmp}")
 
 

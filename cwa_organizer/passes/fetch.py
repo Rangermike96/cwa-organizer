@@ -139,6 +139,13 @@ def validate(meta, book, parsed, file_medium, cfg, assume_english: bool = False)
         return f"wrong edition: '{meta.title}' is manga, this book is {'prose' if file_medium else 'not known to be a comic'}"
     if rp.marker == "novel" and file_medium == "comic":
         return f"wrong edition: '{meta.title}' is a novel, this book is a comic"
+    # Some sources spell the edition out without brackets ("... Home! Manga, Vol. 3").
+    ours_words = {w.strip(",.:;!?()") for w in fold(parsed.original if parsed else book.title).split()}
+    theirs_words = {w.strip(",.:;!?()") for w in fold(meta.title).split()}
+    if "manga" in theirs_words and "manga" not in ours_words and file_medium != "comic":
+        return f"wrong edition: '{meta.title}' says manga, this book is prose"
+    if file_medium == "comic" and "manga" not in theirs_words and "ranobe" in theirs_words:
+        return f"wrong edition: '{meta.title}' is a light novel, this book is a comic"
     if file_medium == "novel" and any(fold(t) in ("manga", "comics & graphic novels / manga") for t in meta.tags) \
             and not any("light novel" in fold(t) for t in meta.tags):
         return f"wrong edition: '{meta.title}' is tagged Manga, this book is prose"
@@ -261,6 +268,16 @@ def _short(detail: str, limit: int = 140) -> str:
     return " ".join((detail or "").split())[:limit]
 
 
+def _adds_anything(book, meta) -> bool:
+    """True when this result would actually fill something the book is missing."""
+    if meta.comments and not (book.comments or "").strip():
+        return True
+    have = {k.lower() for k in (book.identifiers or {})}
+    if any(k.lower() not in have for k in (meta.identifiers or {})):
+        return True
+    return bool(meta.series and meta.series_index is not None and not book.series)
+
+
 def _try_hardcover(ctx, hc, book, parsed, medium, author, rejected) -> tuple:
     """Last resort when the calibre sources have nothing acceptable."""
     cfg = ctx.cfg
@@ -276,8 +293,8 @@ def _try_hardcover(ctx, hc, book, parsed, medium, author, rejected) -> tuple:
         meta = from_hardcover(hit)
         if not meta.title or not _latin(meta.title):
             continue
-        if not (meta.comments or meta.identifiers):
-            continue  # nothing this source could add
+        if not _adds_anything(book, meta):
+            continue  # a match that fills nothing is not worth taking
         reason = validate(meta, book, parsed, medium, cfg, assume_english=True)
         if reason:
             rejected.append(f"Hardcover '{meta.title}' -> {reason}")
@@ -328,6 +345,11 @@ def _fetch_loop(ctx, todo, fetcher, fc, flush_every, bar) -> None:
             if res.kind == FetchResult.ERROR:
                 had_error = True
                 ctx.log.detail(f"    '{variant}': gave up ({_short(res.detail)})")
+                if err_budget <= 0:
+                    # The source is blocking us, not answering about this book. Other
+                    # phrasings will fail the same way, so stop asking and try Hardcover.
+                    ctx.log.detail("    source is refusing requests; skipping the other phrasings")
+                    break
                 continue
             if res.kind == FetchResult.NO_MATCH:
                 no_match_seen = True
